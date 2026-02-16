@@ -15,8 +15,10 @@ Frigate API: {"intel-vaapi": {"gpu": "", "mem": ""}}
 ```
 
 **After (with this fix):**
+
+![Frigate GPU Stats Working](screenshot.png)
+
 ```
-Frigate UI: Intel GPU: 18%
 Frigate API: {"intel-vaapi": {"gpu": "18.07%", "mem": "-%"}}
 ```
 
