@@ -1,6 +1,8 @@
 #!/bin/bash
-# Fake intel_gpu_top using fdinfo for accurate GPU stats on Alder Lake-N
-# Uses cached snapshots - no sleep needed, fits within Frigate's 0.5s timeout
+# Drop-in intel_gpu_top replacement using DRM fdinfo
+# Accurate GPU stats for Alder Lake-N and Gen 12+ on Frigate NVR
+# Supports both VAAPI and QSV hardware acceleration
+# Uses cached snapshots - completes in <100ms, fits within Frigate's 0.5s timeout
 # Frigate calls: timeout 0.5s intel_gpu_top -J -o - -s 1000
 
 CACHE=/tmp/.gpu_stats_cache
@@ -13,8 +15,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Find VAAPI ffmpeg PIDs
-PIDS=$(ps aux 2>/dev/null | grep 'ffmpeg.*vaapi' | grep -v grep | awk '{print $2}')
+# Find ffmpeg PIDs using Intel HW acceleration (VAAPI or QSV)
+PIDS=$(ps aux 2>/dev/null | grep -E 'ffmpeg.*(vaapi|qsv)' | grep -v grep | awk '{print $2}')
 
 if [ -z "$PIDS" ]; then
     echo '{"period":{"duration":1000.0,"unit":"ms"},"frequency":{"requested":750,"actual":200,"unit":"MHz"},"interrupts":{"count":0,"unit":"irq/s"},"rc6":{"value":99.0,"unit":"%"},"power":{"GPU":0.0,"Package":0.0,"unit":"W"},"engines":{"Render/3D/0":{"busy":0.0,"sema":0,"wait":0,"unit":"%"},"Blitter/0":{"busy":0.0,"sema":0,"wait":0,"unit":"%"},"Video/0":{"busy":0.0,"sema":0,"wait":0,"unit":"%"},"VideoEnhance/0":{"busy":0.0,"sema":0,"wait":0,"unit":"%"}}}'
@@ -22,12 +24,15 @@ if [ -z "$PIDS" ]; then
     exit 0
 fi
 
-# Current snapshot
+# Current snapshot - read GPU engine times from DRM fdinfo
 NOW_NS=$(date +%s%N)
 TOTAL_R=0; TOTAL_V=0
 for pid in $PIDS; do
-    r=$(cat /proc/$pid/fdinfo/4 2>/dev/null | awk '/drm-engine-render:/ {print $2}')
-    v=$(cat /proc/$pid/fdinfo/4 2>/dev/null | awk '/drm-engine-video:/ {print $2}')
+    # Auto-detect DRM fdinfo file (works with both VAAPI and QSV)
+    FDINFO=$(grep -l 'drm-driver:' /proc/$pid/fdinfo/* 2>/dev/null | head -1)
+    [ -z "$FDINFO" ] && continue
+    # Read both engine counters in a single pass (%.0f handles large nanosecond values)
+    read r v < <(awk '/drm-engine-render:/ {r=$2} /drm-engine-video:/ {v=$2} END {printf "%.0f %.0f\n", r, v}' "$FDINFO" 2>/dev/null)
     TOTAL_R=$((TOTAL_R + ${r:-0}))
     TOTAL_V=$((TOTAL_V + ${v:-0}))
 done
@@ -54,7 +59,7 @@ fi
 # Save current snapshot for next call
 echo "$NOW_NS $TOTAL_R $TOTAL_V" > "$CACHE"
 
-# Output JSON
+# Output JSON in intel_gpu_top format
 echo "{\"period\":{\"duration\":1000.0,\"unit\":\"ms\"},\"frequency\":{\"requested\":750,\"actual\":750,\"unit\":\"MHz\"},\"interrupts\":{\"count\":0,\"unit\":\"irq/s\"},\"rc6\":{\"value\":0.0,\"unit\":\"%\"},\"power\":{\"GPU\":0.0,\"Package\":0.0,\"unit\":\"W\"},\"engines\":{\"Render/3D/0\":{\"busy\":${RP},\"sema\":0,\"wait\":0,\"unit\":\"%\"},\"Blitter/0\":{\"busy\":0.0,\"sema\":0,\"wait\":0,\"unit\":\"%\"},\"Video/0\":{\"busy\":${VP},\"sema\":0,\"wait\":0,\"unit\":\"%\"},\"VideoEnhance/0\":{\"busy\":0.0,\"sema\":0,\"wait\":0,\"unit\":\"%\"}}}"
 
 # Keep running so timeout kills us with exit 124

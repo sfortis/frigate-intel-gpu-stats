@@ -1,20 +1,27 @@
 #!/bin/bash
-# GPU usage monitor for Frigate VAAPI transcoding
+# GPU usage monitor for Frigate Intel HW transcoding (VAAPI and QSV)
 # Reads drm-engine fdinfo from ffmpeg processes (accurate for Alder Lake-N)
 # Usage: gpu_usage.sh [interval_seconds] (default: 5)
 
 INTERVAL=${1:-5}
 
-get_engine_ns() {
-    local pid=$1 engine=$2
-    docker exec frigate cat /proc/$pid/fdinfo/4 2>/dev/null | grep "drm-engine-${engine}:" | awk '{print $2}'
+get_drm_fd() {
+    local pid=$1
+    docker exec frigate grep -l 'drm-driver:' /proc/$pid/fdinfo/* 2>/dev/null | head -1
 }
 
-# Find VAAPI ffmpeg PIDs
-PIDS=$(docker exec frigate ps aux | grep 'ffmpeg.*vaapi' | grep -v grep | awk '{print $2}')
+get_engine_ns() {
+    local pid=$1 engine=$2
+    local fdinfo=$(get_drm_fd $pid)
+    [ -z "$fdinfo" ] && echo 0 && return
+    docker exec frigate awk "/drm-engine-${engine}:/ {print \$2}" "$fdinfo" 2>/dev/null
+}
+
+# Find ffmpeg PIDs using Intel HW acceleration (VAAPI or QSV)
+PIDS=$(docker exec frigate ps aux | grep -E 'ffmpeg.*(vaapi|qsv)' | grep -v grep | awk '{print $2}')
 
 if [ -z "$PIDS" ]; then
-    echo "No VAAPI ffmpeg processes found."
+    echo "No VAAPI/QSV ffmpeg processes found."
     exit 1
 fi
 
@@ -74,12 +81,16 @@ printf "%-16s %8s %8s %8s\n" "----------------" "--------" "--------" "--------"
 printf "%-16s %7s%% %7s%% %7s%%\n" "TOTAL" "$rp" "$vp" "$tp"
 
 # Memory
-MEM=$(docker exec frigate cat /proc/$(echo $PIDS | awk '{print $1}')/fdinfo/4 2>/dev/null | grep 'drm-total-system0' | awk '{print $2}')
-if [ -n "$MEM" ]; then
-    MEM_MB=$((MEM / 1024))
-    printf "\nGPU memory (per process): %d MB\n" "$MEM_MB"
+FIRST_PID=$(echo $PIDS | awk '{print $1}')
+DRM_FD=$(get_drm_fd $FIRST_PID)
+if [ -n "$DRM_FD" ]; then
+    MEM=$(docker exec frigate awk '/drm-total-system0/ {print $2}' "$DRM_FD" 2>/dev/null)
+    if [ -n "$MEM" ]; then
+        MEM_MB=$((MEM / 1024))
+        printf "\nGPU memory (per process): %d MB\n" "$MEM_MB"
+    fi
 fi
 
 echo ""
-echo "Render = scale_vaapi (downscale), Video = h264_vaapi (encode)"
+echo "Render = scale_vaapi/qsv (downscale), Video = h264_vaapi/qsv (encode)"
 echo "Sampled over ${INTERVAL}s interval"

@@ -3,15 +3,14 @@
 A drop-in replacement for `intel_gpu_top` that provides **accurate GPU usage stats** in [Frigate NVR](https://frigate.video/) on Intel Alder Lake-N (N100/N200/N305) and other Gen 12+ processors.
 
 > **Warning**
-> - This script only measures **VAAPI ffmpeg processes**. If you use QSV, OpenVINO, or other acceleration methods, it will not detect them.
+> - This script measures **VAAPI and QSV** ffmpeg processes. Other acceleration methods (OpenVINO, etc.) are not detected.
 > - The first reading after a container restart will show **0%** (the cache needs one cycle to initialize, stats appear after ~15 seconds).
-> - The script assumes the DRM device is on **file descriptor 4** (`/proc/PID/fdinfo/4`). This is consistent across Frigate's ffmpeg processes but may differ in other setups.
 > - Requires the container to run in **privileged mode** (or with access to `/proc/PID/fdinfo` of ffmpeg processes).
 > - This is a **read-only volume mount**, nothing is permanently modified. Remove the volume line from `docker-compose.yml` to revert to the original `intel_gpu_top`.
 
 ## The Problem
 
-Frigate uses `intel_gpu_top` to display GPU utilization in the web UI. On Intel Alder Lake-N (Gen 12.2) and newer GPUs, `intel_gpu_top` v1.27 (bundled in Frigate and Debian 12) **reports 0%** for the Video and Render engines, even when VAAPI hardware transcoding is actively running.
+Frigate uses `intel_gpu_top` to display GPU utilization in the web UI. On Intel Alder Lake-N (Gen 12.2) and newer GPUs, `intel_gpu_top` v1.27 (bundled in Frigate and Debian 12) **reports 0%** for the Video and Render engines, even when VAAPI/QSV hardware transcoding is actively running.
 
 This is a known limitation of `intel_gpu_top`'s performance counter reading on Gen 12+ architectures. The fixed-function media engines (hardware encode/decode) are not properly captured by the legacy perf counters.
 
@@ -34,15 +33,16 @@ Frigate API: {"intel-vaapi": {"gpu": "18.07%", "mem": "-%"}}
 Instead of using broken perf counters, this script reads GPU engine usage directly from the **Linux DRM fdinfo interface** (`/proc/PID/fdinfo`), which provides accurate per-process GPU engine time in nanoseconds.
 
 The script:
-1. Finds all VAAPI ffmpeg processes inside the Frigate container
-2. Reads cumulative GPU engine time from `/proc/PID/fdinfo/4` for each process
-3. Compares with a cached snapshot from the previous invocation (every ~15s)
-4. Calculates the delta to get real-time utilization percentages
-5. Outputs JSON in the exact format Frigate expects from `intel_gpu_top`
+1. Finds all VAAPI/QSV ffmpeg processes inside the Frigate container
+2. Auto-detects the DRM file descriptor for each process (no hardcoded fd number)
+3. Reads cumulative GPU engine time from the DRM fdinfo
+4. Compares with a cached snapshot from the previous invocation (every ~15s)
+5. Calculates the delta to get real-time utilization percentages
+6. Outputs JSON in the exact format Frigate expects from `intel_gpu_top`
 
 Engines measured:
-- **Render/3D** (`drm-engine-render`): Used by `scale_vaapi` for resolution downscaling
-- **Video** (`drm-engine-video`): Used by `h264_vaapi` for H.264 hardware encoding
+- **Render/3D** (`drm-engine-render`): Used by `scale_vaapi`/`scale_qsv` for resolution downscaling
+- **Video** (`drm-engine-video`): Used by `h264_vaapi`/`h264_qsv` for H.264 hardware encoding
 
 ## Installation
 
@@ -96,7 +96,7 @@ TOTAL               16.9%    23.5%    40.4%
 
 GPU memory (per process): 40 MB
 
-Render = scale_vaapi (downscale), Video = h264_vaapi (encode)
+Render = scale_vaapi/qsv (downscale), Video = h264_vaapi/qsv (encode)
 Sampled over 5s interval
 ```
 
@@ -105,6 +105,7 @@ Sampled over 5s interval
 ## Compatibility
 
 - **Tested on:** Intel N100 (Alder Lake-N, Gen 12.2)
+- **HW acceleration:** VAAPI and QSV (both supported)
 - **Frigate:** 0.16.x, 0.17.x (any version that uses `intel_gpu_top`)
 - **Should work on:** Any Intel Gen 12+ GPU where `intel_gpu_top` reports 0%
   - Alder Lake (12th Gen)
@@ -130,7 +131,7 @@ Our script completes in <100ms (no sleep needed thanks to the cache approach), w
 The Linux kernel exposes per-process GPU engine usage via DRM fdinfo:
 
 ```
-$ cat /proc/<ffmpeg_pid>/fdinfo/4
+$ cat /proc/<ffmpeg_pid>/fdinfo/<drm_fd>
 drm-driver:     i915
 drm-engine-render:    62418463951 ns
 drm-engine-video:     52567609040 ns
@@ -138,6 +139,8 @@ drm-engine-video-enhance: 0 ns
 ```
 
 These are cumulative nanosecond counters. By taking two snapshots and dividing the delta by elapsed wall-clock time, we get accurate utilization percentages regardless of GPU generation.
+
+The script auto-detects the correct file descriptor by searching for the one containing `drm-driver:`, so it works regardless of whether the GPU fd is 3, 4, 5, or any other number.
 
 ## License
 
