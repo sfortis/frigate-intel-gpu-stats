@@ -2,6 +2,13 @@
 
 A drop-in replacement for `intel_gpu_top` that provides **accurate GPU usage stats** in [Frigate NVR](https://frigate.video/) on Intel Alder Lake-N (N100/N200/N305) and other Gen 12+ processors.
 
+> **Warning**
+> - This script only measures **VAAPI ffmpeg processes**. If you use QSV, OpenVINO, or other acceleration methods, it will not detect them.
+> - The first reading after a container restart will show **0%** (the cache needs one cycle to initialize, stats appear after ~15 seconds).
+> - The script assumes the DRM device is on **file descriptor 4** (`/proc/PID/fdinfo/4`). This is consistent across Frigate's ffmpeg processes but may differ in other setups.
+> - Requires the container to run in **privileged mode** (or with access to `/proc/PID/fdinfo` of ffmpeg processes).
+> - This is a **read-only volume mount**, nothing is permanently modified. Remove the volume line from `docker-compose.yml` to revert to the original `intel_gpu_top`.
+
 ## The Problem
 
 Frigate uses `intel_gpu_top` to display GPU utilization in the web UI. On Intel Alder Lake-N (Gen 12.2) and newer GPUs, `intel_gpu_top` v1.27 (bundled in Frigate and Debian 12) **reports 0%** for the Video and Render engines, even when VAAPI hardware transcoding is actively running.
