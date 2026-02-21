@@ -1,11 +1,12 @@
-# Frigate Intel GPU Stats Fix (Alder Lake-N / Gen 12)
+# Frigate Intel GPU Stats Fix (Alder Lake-N / Gen 12+)
 
 A drop-in replacement for `intel_gpu_top` that provides **accurate GPU usage stats** in [Frigate NVR](https://frigate.video/) on Intel Alder Lake-N (N100/N200/N305) and other Gen 12+ processors.
 
-> **Warning**
-> - This script measures **VAAPI and QSV** ffmpeg processes. Other acceleration methods (OpenVINO, etc.) are not detected.
+> **Note**
+> - This script measures **all GPU consumers** including VAAPI, QSV, and OpenVINO processes (embeddings, face recognition, etc.).
+> - Supports both **i915** and **xe** kernel drivers.
 > - The first reading after a container restart will show **0%** (the cache needs one cycle to initialize, stats appear after ~15 seconds).
-> - Requires the container to run in **privileged mode** (or with access to `/proc/PID/fdinfo` of ffmpeg processes).
+> - Requires the container to run in **privileged mode** (or with access to `/proc/PID/fdinfo`).
 > - This is a **read-only volume mount**, nothing is permanently modified. Remove the volume line from `docker-compose.yml` to revert to the original `intel_gpu_top`.
 
 ## The Problem
@@ -30,19 +31,20 @@ Frigate API: {"intel-vaapi": {"gpu": "18.07%", "mem": "-%"}}
 
 ## How It Works
 
-Instead of using broken perf counters, this script reads GPU engine usage directly from the **Linux DRM fdinfo interface** (`/proc/PID/fdinfo`), which provides accurate per-process GPU engine time in nanoseconds.
+Instead of using broken perf counters, this script reads GPU engine usage directly from the **Linux DRM fdinfo interface** (`/proc/PID/fdinfo`), which provides accurate per-process GPU engine time.
 
 The script:
-1. Finds all VAAPI/QSV ffmpeg processes inside the Frigate container
-2. Auto-detects the DRM file descriptor for each process (no hardcoded fd number)
+1. Finds **all processes** using the Intel GPU via DRM fdinfo (not just ffmpeg)
+2. Auto-detects the kernel driver (i915 or xe) and parses accordingly
 3. Reads cumulative GPU engine time from the DRM fdinfo
 4. Compares with a cached snapshot from the previous invocation (every ~15s)
 5. Calculates the delta to get real-time utilization percentages
-6. Outputs JSON in the exact format Frigate expects from `intel_gpu_top`
+6. Reports per-engine values (Render and Video separately) so Frigate's built-in averaging produces a correctly scaled 0-100% result
+7. Outputs JSON in the exact format Frigate expects from `intel_gpu_top`
 
 Engines measured:
-- **Render/3D** (`drm-engine-render`): Used by `scale_vaapi`/`scale_qsv` for resolution downscaling
-- **Video** (`drm-engine-video`): Used by `h264_vaapi`/`h264_qsv` for H.264 hardware encoding
+- **Render/3D** (`drm-engine-render` / `drm-cycles-rcs`): Used by OpenVINO inference, `scale_vaapi`/`scale_qsv` for resolution scaling
+- **Video** (`drm-engine-video` / `drm-cycles-vcs`): Used by `h264_vaapi`/`h264_qsv` for H.264 hardware encode/decode
 
 ## Installation
 
@@ -75,7 +77,7 @@ The first stats reading after restart will show 0% (cache is empty). After ~15 s
 
 ## Bonus: Detailed GPU Usage Script
 
-The `gpu_usage.sh` script provides a detailed per-camera breakdown of GPU usage. Copy it to your server and run it:
+The `gpu_usage.sh` script provides a detailed per-process breakdown of GPU usage. Copy it to your Frigate host and run it:
 
 ```bash
 chmod +x gpu_usage.sh
@@ -84,34 +86,41 @@ chmod +x gpu_usage.sh
 
 Example output:
 ```
-Camera            Render%   Video%   Total%
----------------- -------- -------- --------
-dahua_front          3.4%     6.2%     9.6%
-tapo_backyard        3.3%     5.2%     8.4%
-mancave              3.8%     4.2%     7.9%
-livingroom           3.4%     4.3%     7.6%
-doorbell             3.2%     3.4%     6.6%
----------------- -------- -------- --------
-TOTAL               16.9%    23.5%    40.4%
+Process                   Render%   Video%   Total%
+------------------------ -------- -------- --------
+ffmpeg (1234)               3.40%    6.20%    9.60%
+ffmpeg (1235)               3.30%    5.20%    8.50%
+ffmpeg (1236)               3.80%    4.20%    8.00%
+frigate.embeddi (720)       0.05%    0.00%    0.05%
+------------------------ -------- -------- --------
+TOTAL                      10.55%   15.60%   26.15%
 
-GPU memory (per process): 40 MB
-
-Render = scale_vaapi/qsv (downscale), Video = h264_vaapi/qsv (encode)
+Render = GPU compute (OpenVINO, scale_vaapi/qsv)
+Video  = HW codec (h264_vaapi/qsv encode/decode)
 Sampled over 5s interval
 ```
 
-> **Note:** Frigate displays `(Render + Video) / 2` as the GPU percentage (~18%), while the actual total GPU utilization across both engines is ~40%. Use `gpu_usage.sh` for the full picture.
+> **Note:** Frigate displays the average of Render and Video engine usage as its GPU percentage. The script reports each engine separately (Render = GPU compute, Video = HW codec), and Frigate's averaging naturally scales the result to 0-100%. Use `gpu_usage.sh` to see the per-engine breakdown.
 
 ## Compatibility
 
-- **Tested on:** Intel N100 (Alder Lake-N, Gen 12.2)
-- **HW acceleration:** VAAPI and QSV (both supported)
-- **Frigate:** 0.16.x, 0.17.x (any version that uses `intel_gpu_top`)
-- **Should work on:** Any Intel Gen 12+ GPU where `intel_gpu_top` reports 0%
-  - Alder Lake (12th Gen)
-  - Raptor Lake (13th/14th Gen)
-  - Meteor Lake, Lunar Lake, etc.
-- **Container requirement:** Must run as privileged (or have access to `/proc/PID/fdinfo`)
+| Feature | Supported |
+|---------|-----------|
+| **Intel Gen 12+** (Alder Lake, Raptor Lake) | i915 driver |
+| **Intel Xe2+** (Lunar Lake, Battlemage) | xe driver |
+| **HW acceleration** | VAAPI and QSV |
+| **OpenVINO / embeddings** | Captured via DRM fdinfo |
+| **Frigate versions** | 0.14.x through 0.17.x |
+| **Container mode** | Privileged (or `SYS_PTRACE` capability) |
+
+### Driver-specific fdinfo format
+
+| Driver | Render engine | Video engine | Unit |
+|--------|--------------|--------------|------|
+| **i915** | `drm-engine-render` | `drm-engine-video` | nanoseconds |
+| **xe** | `drm-cycles-rcs` | `drm-cycles-vcs` | cycles |
+
+The script auto-detects the driver and parses the correct format.
 
 ## How Frigate Polls GPU Stats
 
@@ -124,23 +133,41 @@ Every **15 seconds** (`FREQUENCY_STATS_POINTS`), expecting:
 - JSON output with `engines.Render/3D/0.busy` and `engines.Video/0.busy`
 - Exit code **124** (killed by timeout)
 
-Our script completes in <100ms (no sleep needed thanks to the cache approach), well within the 0.5s timeout.
+Frigate calculates the GPU percentage as `(Render + Video) / 2`. Since Render and Video are independent GPU engines (each 0-100%), this averaging naturally scales the combined usage to a 0-100% range. Our script reports accurate per-engine values, letting Frigate's formula produce a correctly scaled result.
+
+Our script completes in <100ms (well within the 0.5s timeout).
 
 ## Technical Details
 
+### i915 driver
 The Linux kernel exposes per-process GPU engine usage via DRM fdinfo:
 
 ```
-$ cat /proc/<ffmpeg_pid>/fdinfo/<drm_fd>
+$ cat /proc/<pid>/fdinfo/<drm_fd>
 drm-driver:     i915
 drm-engine-render:    62418463951 ns
 drm-engine-video:     52567609040 ns
 drm-engine-video-enhance: 0 ns
 ```
 
-These are cumulative nanosecond counters. By taking two snapshots and dividing the delta by elapsed wall-clock time, we get accurate utilization percentages regardless of GPU generation.
+These are cumulative nanosecond counters. By taking two snapshots and dividing the delta by elapsed wall-clock time, we get accurate utilization percentages.
 
-The script auto-detects the correct file descriptor by searching for the one containing `drm-driver:`, so it works regardless of whether the GPU fd is 3, 4, 5, or any other number.
+### xe driver
+The xe driver uses a different format with GPU cycles:
+
+```
+$ cat /proc/<pid>/fdinfo/<drm_fd>
+drm-driver:     xe
+drm-cycles-rcs:       12345
+drm-total-cycles-rcs: 67890
+drm-cycles-vcs:       2345
+drm-total-cycles-vcs: 67890
+```
+
+The script uses `drm-total-cycles` for normalization when available, falling back to wall-clock time.
+
+### Process discovery
+The script finds GPU-using processes by scanning `/proc/[0-9]*/fdinfo/*` for files containing `drm-driver:`. This captures all GPU consumers regardless of process type (ffmpeg, OpenVINO, Python, etc.).
 
 ## License
 

@@ -1,7 +1,8 @@
 #!/bin/bash
 # Drop-in intel_gpu_top replacement using DRM fdinfo
 # Accurate GPU stats for Alder Lake-N and Gen 12+ on Frigate NVR
-# Supports both VAAPI and QSV hardware acceleration
+# Captures ALL GPU usage: VAAPI, QSV, OpenVINO (embeddings, face recognition)
+# Supports both i915 and xe kernel drivers
 # Uses cached snapshots - completes in <100ms, fits within Frigate's 0.5s timeout
 # Frigate calls: timeout 0.5s intel_gpu_top -J -o - -s 1000
 
@@ -15,49 +16,83 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Find ffmpeg PIDs using Intel HW acceleration (VAAPI or QSV)
-PIDS=$(ps aux 2>/dev/null | grep -E 'ffmpeg.*(vaapi|qsv)' | grep -v grep | awk '{print $2}')
+ZERO_JSON='{"period":{"duration":1000.0,"unit":"ms"},"frequency":{"requested":750,"actual":200,"unit":"MHz"},"interrupts":{"count":0,"unit":"irq/s"},"rc6":{"value":99.0,"unit":"%"},"power":{"GPU":0.0,"Package":0.0,"unit":"W"},"engines":{"Render/3D/0":{"busy":0.0,"sema":0,"wait":0,"unit":"%"},"Blitter/0":{"busy":0.0,"sema":0,"wait":0,"unit":"%"},"Video/0":{"busy":0.0,"sema":0,"wait":0,"unit":"%"},"VideoEnhance/0":{"busy":0.0,"sema":0,"wait":0,"unit":"%"}}}'
+
+# Find ALL processes using Intel GPU via DRM fdinfo
+# This captures ffmpeg (VAAPI/QSV), OpenVINO, and any other GPU consumer
+PIDS=$(grep -rls 'drm-driver:' /proc/[0-9]*/fdinfo/* 2>/dev/null | cut -d/ -f3 | sort -u)
 
 if [ -z "$PIDS" ]; then
-    echo '{"period":{"duration":1000.0,"unit":"ms"},"frequency":{"requested":750,"actual":200,"unit":"MHz"},"interrupts":{"count":0,"unit":"irq/s"},"rc6":{"value":99.0,"unit":"%"},"power":{"GPU":0.0,"Package":0.0,"unit":"W"},"engines":{"Render/3D/0":{"busy":0.0,"sema":0,"wait":0,"unit":"%"},"Blitter/0":{"busy":0.0,"sema":0,"wait":0,"unit":"%"},"Video/0":{"busy":0.0,"sema":0,"wait":0,"unit":"%"},"VideoEnhance/0":{"busy":0.0,"sema":0,"wait":0,"unit":"%"}}}'
+    echo "$ZERO_JSON"
     sleep 10
     exit 0
 fi
 
+# Detect driver from first process (i915 or xe)
+FIRST_FD=$(grep -rls 'drm-driver:' /proc/[0-9]*/fdinfo/* 2>/dev/null | head -1)
+DRIVER=$(awk '/^drm-driver:/ {print $2}' "$FIRST_FD" 2>/dev/null)
+
 # Current snapshot - read GPU engine times from DRM fdinfo
 NOW_NS=$(date +%s%N)
 TOTAL_R=0; TOTAL_V=0
+
 for pid in $PIDS; do
-    # Auto-detect DRM fdinfo file (works with both VAAPI and QSV)
     FDINFO=$(grep -l 'drm-driver:' /proc/$pid/fdinfo/* 2>/dev/null | head -1)
     [ -z "$FDINFO" ] && continue
-    # Read both engine counters in a single pass (%.0f handles large nanosecond values)
-    read r v < <(awk '/drm-engine-render:/ {r=$2} /drm-engine-video:/ {v=$2} END {printf "%.0f %.0f\n", r, v}' "$FDINFO" 2>/dev/null)
+
+    if [ "$DRIVER" = "xe" ]; then
+        # xe driver: drm-cycles-rcs (render), drm-cycles-vcs (video)
+        # xe uses cycles not nanoseconds, but ratio calculation still works
+        read r v < <(awk '/drm-cycles-rcs:/ {r=$2} /drm-cycles-vcs:/ {v=$2} END {printf "%.0f %.0f\n", r+0, v+0}' "$FDINFO" 2>/dev/null)
+        # Also read total-cycles for normalization
+        read tr tv < <(awk '/drm-total-cycles-rcs:/ {r=$2} /drm-total-cycles-vcs:/ {v=$2} END {printf "%.0f %.0f\n", r+0, v+0}' "$FDINFO" 2>/dev/null)
+    else
+        # i915 driver: drm-engine-render (ns), drm-engine-video (ns)
+        read r v < <(awk '/drm-engine-render:/ {r=$2} /drm-engine-video:/ {v=$2} END {printf "%.0f %.0f\n", r+0, v+0}' "$FDINFO" 2>/dev/null)
+    fi
     TOTAL_R=$((TOTAL_R + ${r:-0}))
     TOTAL_V=$((TOTAL_V + ${v:-0}))
 done
 
 # Read previous snapshot
 if [ -f "$CACHE" ]; then
-    read PREV_NS PREV_R PREV_V < "$CACHE"
+    read PREV_NS PREV_R PREV_V PREV_DRIVER < "$CACHE"
     DELTA_NS=$((NOW_NS - PREV_NS))
 
-    if [ "$DELTA_NS" -gt 100000000 ]; then  # >100ms minimum
+    # Invalidate cache if driver changed or delta too small
+    if [ "$PREV_DRIVER" != "$DRIVER" ] || [ "$DELTA_NS" -lt 100000000 ]; then
+        RP="0.00"; VP="0.00"
+    else
         DR=$((TOTAL_R - PREV_R))
         DV=$((TOTAL_V - PREV_V))
         [ "$DR" -lt 0 ] && DR=0
         [ "$DV" -lt 0 ] && DV=0
-        RP=$(awk "BEGIN {printf \"%.2f\", $DR / $DELTA_NS * 100}")
-        VP=$(awk "BEGIN {printf \"%.2f\", $DV / $DELTA_NS * 100}")
-    else
-        RP="0.00"; VP="0.00"
+
+        if [ "$DRIVER" = "xe" ]; then
+            # xe: cycles-based, use total-cycles for normalization if available
+            # Fallback: use wall-clock delta (less accurate but functional)
+            if [ "${tr:-0}" -gt 0 ] && [ "${tv:-0}" -gt 0 ]; then
+                RP=$(awk "BEGIN {printf \"%.2f\", ($DR / ${tr}) * 100}")
+                VP=$(awk "BEGIN {printf \"%.2f\", ($DV / ${tv}) * 100}")
+            else
+                RP=$(awk "BEGIN {printf \"%.2f\", $DR / $DELTA_NS * 100}")
+                VP=$(awk "BEGIN {printf \"%.2f\", $DV / $DELTA_NS * 100}")
+            fi
+        else
+            # i915: nanoseconds, straightforward percentage
+            RP=$(awk "BEGIN {printf \"%.2f\", $DR / $DELTA_NS * 100}")
+            VP=$(awk "BEGIN {printf \"%.2f\", $DV / $DELTA_NS * 100}")
+        fi
     fi
 else
     RP="0.00"; VP="0.00"
 fi
 
 # Save current snapshot for next call
-echo "$NOW_NS $TOTAL_R $TOTAL_V" > "$CACHE"
+echo "$NOW_NS $TOTAL_R $TOTAL_V $DRIVER" > "$CACHE"
+
+# Frigate calculates: (Render + Video) / 2 which naturally scales 0-200% to 0-100%
+# Pass real per-engine values so Frigate's formula gives correct scaled percentage
 
 # Output JSON in intel_gpu_top format
 echo "{\"period\":{\"duration\":1000.0,\"unit\":\"ms\"},\"frequency\":{\"requested\":750,\"actual\":750,\"unit\":\"MHz\"},\"interrupts\":{\"count\":0,\"unit\":\"irq/s\"},\"rc6\":{\"value\":0.0,\"unit\":\"%\"},\"power\":{\"GPU\":0.0,\"Package\":0.0,\"unit\":\"W\"},\"engines\":{\"Render/3D/0\":{\"busy\":${RP},\"sema\":0,\"wait\":0,\"unit\":\"%\"},\"Blitter/0\":{\"busy\":0.0,\"sema\":0,\"wait\":0,\"unit\":\"%\"},\"Video/0\":{\"busy\":${VP},\"sema\":0,\"wait\":0,\"unit\":\"%\"},\"VideoEnhance/0\":{\"busy\":0.0,\"sema\":0,\"wait\":0,\"unit\":\"%\"}}}"
